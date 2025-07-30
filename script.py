@@ -1,78 +1,87 @@
 import os
 import logging
-import csv
-from datetime import datetime, timedelta
+import json
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, filename='todo_repository.log', 
-                    format='%(asctime)s:%(levelname)s:%(message)s')
+logging.basicConfig(filename='weather_app.log', level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class TodoRepository:
-    def __init__(self, filename='todos.csv'):
-        self.filename = filename
-        self.todos = []
-        self.load_todos()
+PREFERENCES_FILE = 'user_preferences.json'
+
+def load_preferences():
+    if os.path.exists(PREFERENCES_FILE):
+        try:
+            with open(PREFERENCES_FILE, 'r') as file:
+                preferences = json.load(file)
+                logging.info("Loaded user preferences successfully.")
+                return preferences
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logging.error(f"Error loading preferences: {e}")
+            return {}
+    else:
+        logging.info("No preferences file found; loading defaults.")
+        return {}
+
+def save_preferences(preferences):
+    try:
+        with open(PREFERENCES_FILE, 'w') as file:
+            json.dump(preferences, file)
+            logging.info("User preferences saved successfully.")
+    except IOError as e:
+        logging.error(f"Error saving preferences: {e}")
+
+def display_weather(preferences):
+    unit = preferences.get('temperature_unit', 'Celsius')
+    language = preferences.get('display_language', 'English')
+    location = preferences.get('preferred_location', 'your area')
+
+    # Simulated weather data
+    weather_data = {
+        'temperature': 22,  # degrees Celsius
+        'condition': 'Sunny'
+    }
     
-    def load_todos(self):
-        if os.path.exists(self.filename):
-            try:
-                with open(self.filename, mode='r', newline='') as file:
-                    reader = csv.reader(file)
-                    for row in reader:
-                        self.todos.append({'task': row[0], 'due_date': row[1], 'completed': row[2] == 'True'})
-                logging.info("Todos loaded successfully.")
-            except Exception as e:
-                logging.error(f"Error loading todos: {e}")
+    if unit == 'Fahrenheit':
+        weather_data['temperature'] = weather_data['temperature'] * 9/5 + 32
+        
+    print(f"Weather in {location}: {weather_data['temperature']:.1f}°{unit[0]} - {weather_data['condition']}")
 
-    def save_todos(self):
-        try:
-            with open(self.filename, mode='w', newline='') as file:
-                writer = csv.writer(file)
-                for todo in self.todos:
-                    writer.writerow([todo['task'], todo['due_date'], todo['completed']])
-            logging.info("Todos saved successfully.")
-        except Exception as e:
-            logging.error(f"Error saving todos: {e}")
+def update_user_preferences(preferences):
+    print("Update your preferences:")
+    
+    temperature_unit = input("Select temperature unit (Celsius/Fahrenheit): ")
+    if temperature_unit not in ['Celsius', 'Fahrenheit']:
+        logging.warning("Invalid temperature unit selected.")
+        print("Invalid selection for temperature unit; defaulting to Celsius.")
+        temperature_unit = 'Celsius'
+    
+    display_language = input("Select display language (English/Other): ")
+    if display_language not in ['English', 'Other']:
+        logging.warning("Invalid language selected.")
+        print("Invalid selection for language; defaulting to English.")
+        display_language = 'English'
+    
+    preferred_location = input("Enter your preferred location: ")
+    
+    preferences['temperature_unit'] = temperature_unit
+    preferences['display_language'] = display_language
+    preferences['preferred_location'] = preferred_location
 
-    def add_task(self, task, due_date):
-        try:
-            due_date_obj = datetime.strptime(due_date, '%Y-%m-%d')
-            self.todos.append({'task': task, 'due_date': due_date_obj.date(), 'completed': False})
-            self.save_todos()
-            self.send_email_notification(task, due_date)
-            logging.info(f"Task added: {task} with due date {due_date}.")
-        except Exception as e:
-            logging.error(f"Error adding task: {e}")
-
-    def complete_task(self, task):
-        try:
-            for todo in self.todos:
-                if todo['task'] == task and not todo['completed']:
-                    todo['completed'] = True
-                    self.save_todos()
-                    self.send_email_notification(task, 'completed')
-                    logging.info(f"Task completed: {task}.")
-                    return
-            logging.warning(f"Task not found or already completed: {task}.")
-        except Exception as e:
-            logging.error(f"Error completing task: {e}")
-
-    def send_email_notification(self, task, due_date):
-        # Simulated email sending function
-        logging.info(f"Sending email notification for task: {task}, due date: {due_date}.")
-
-    def show_todos(self):
-        for todo in self.todos:
-            status = "✓" if todo['completed'] else "✗"
-            logging.info(f"Task: {todo['task']}, Due: {todo['due_date']}, Status: {status}")
+    save_preferences(preferences)
 
 def main():
-    todo_repo = TodoRepository()
-    todo_repo.add_task('Finish the report', '2023-10-10')
-    todo_repo.add_task('Call the plumber', '2023-10-11')
-    todo_repo.show_todos()
-    todo_repo.complete_task('Finish the report')
-    todo_repo.show_todos()
+    logging.info("Weather app started.")
+    preferences = load_preferences()
+    
+    while True:
+        action = input("Would you like to (1) view weather or (2) update preferences? Enter 'q' to quit: ")
+        if action == '1':
+            display_weather(preferences)
+        elif action == '2':
+            update_user_preferences(preferences)
+        elif action.lower() == 'q':
+            logging.info("Exiting the weather app.")
+            break
+        else:
+            print("Invalid selection. Please try again.")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
