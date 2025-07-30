@@ -1,109 +1,66 @@
-import os
 import logging
+import os
 import csv
-from fastapi import FastAPI, Depends, HTTPException, status
+import hashlib
+import secrets
+import jwt
+from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy import create_engine, Column, Integer, String, ForeignKey
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship, Session
+from sqlalchemy.orm import sessionmaker, declarative_base
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
-from typing import List, Dict
-from cryptography.fernet import Fernet
-from functools import wraps
+from typing import List, Optional
 
-# Setup logging
-logging.basicConfig(filename='dais_project.log', level=logging.INFO)
+logging.basicConfig(filename='dais_project.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Database setup
 DATABASE_URL = "sqlite:///./dais_project.db"
 engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-
-# Role model
-class Role(Base):
-    __tablename__ = "roles"
-
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, unique=True, index=True)
-    permissions = Column(String)  # Could be a JSON String of permissions
-
-
-# User model
 class User(Base):
-    __tablename__ = "users"
-
+    __tablename__ = 'users'
+    
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
-    password = Column(String)
-    role_id = Column(Integer, ForeignKey("roles.id"))
-    role = relationship("Role")
+    hashed_password = Column(String)
+    role = Column(String)
 
+class Role(Base):
+    __tablename__ = 'roles'
+    
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True)
 
-# Create tables in the database
 Base.metadata.create_all(bind=engine)
 
-
-# Pydantic schemas
 class UserCreate(BaseModel):
     username: str
     password: str
-    role_id: int
-
+    role: str
 
 class UserResponse(BaseModel):
     id: int
     username: str
     role: str
 
+class RoleCreate(BaseModel):
+    name: str
 
-# RBAC decoration
-def rbac_required(permission: str):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(user: User = Depends(get_current_user), *args, **kwargs):
-            if permission not in user.role.permissions.split(','):
-                logging.warning(f"Access denied for user {user.username} on {permission}.")
-                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access forbidden")
-            return func(user, *args, **kwargs)
-        return wrapper
-    return decorator
+class RBAC:
+    def __init__(self):
+        self.permissions = {
+            "admin": ["read", "write", "delete"],
+            "editor": ["read", "write"],
+            "viewer": ["read"],
+        }
 
+    def check_permission(self, role: str, permission: str) -> bool:
+        return permission in self.permissions.get(role, [])
+        
+rbac_system = RBAC()
 
-def get_current_user(username: str, db: Session = Depends(get_db)) -> User:
-    user = db.query(User).filter(User.username == username).first()
-    if user is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
-    return user
-
-
-# Initialize FastAPI app
 app = FastAPI()
-
-
-@app.post("/users/", response_model=UserResponse)
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = User(username=user.username, password=encrypt_password(user.password), role_id=user.role_id)
-    db.add(db_user)
-    db.commit()
-    db.refresh(db_user)
-    logging.info(f"User created: {user.username}")
-    return db_user
-
-
-@app.get("/users/", response_model=List[UserResponse])
-def read_users(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
-    users = db.query(User).offset(skip).limit(limit).all()
-    logging.info(f"Fetched users: {len(users)}")
-    return users
-
-
-def encrypt_password(password: str) -> str:
-    key = Fernet.generate_key()
-    cipher_suite = Fernet(key)
-    encrypted_password = cipher_suite.encrypt(password.encode())
-    return encrypted_password.decode()
-
 
 def get_db():
     db = SessionLocal()
@@ -112,35 +69,71 @@ def get_db():
     finally:
         db.close()
 
-
-# CSV Export Functionality
-def export_users_to_csv(db: Session):
+@app.post('/users/', response_model=UserResponse)
+def create_user(user: UserCreate, db: SessionLocal = Depends(get_db)):
+    hashed_password = hashlib.sha256(user.password.encode()).hexdigest()
+    db_user = User(username=user.username, hashed_password=hashed_password, role=user.role)
+    db.add(db_user)
     try:
-        users = db.query(User).all()
-        with open('users.csv', mode='w', newline='') as file:
-            writer = csv.writer(file)
-            writer.writerow(["ID", "Username", "Role ID"])
-            for user in users:
-                writer.writerow([user.id, user.username, user.role_id])
-        logging.info("Exported users to CSV successfully.")
-    except Exception as e:
-        logging.error(f"Error exporting users to CSV: {e}")
+        db.commit()
+        db.refresh(db_user)
+    except IntegrityError:
+        logging.error(f"User creation failed for {user.username}: user already exists.")
+        raise HTTPException(status_code=400, detail="User already exists.")
+    logging.info(f"User created: {user.username} with role {user.role}")
+    return db_user
 
+@app.post('/roles/', response_model=str)
+def create_role(role: RoleCreate, db: SessionLocal = Depends(get_db)):
+    db_role = Role(name=role.name)
+    db.add(db_role)
+    try:
+        db.commit()
+    except IntegrityError:
+        logging.error(f"Role creation failed for {role.name}: role already exists.")
+        raise HTTPException(status_code=400, detail="Role already exists.")
+    logging.info(f"Role created: {role.name}")
+    return role.name
 
-@app.get("/export-users/")
-def export_users(db: Session = Depends(get_db)):
-    export_users_to_csv(db)
-    return {"message": "Users exported to CSV."}
+@app.get('/users/{username}', response_model=UserResponse)
+def read_user(username: str, db: SessionLocal = Depends(get_db)):
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        logging.error(f"User not found: {username}")
+        raise HTTPException(status_code=404, detail="User not found.")
+    logging.info(f"User retrieved: {username}")
+    return user
 
+@app.post('/protected-endpoint/{action}')
+def protected_action(action: str, username: str, db: SessionLocal = Depends(get_db)):
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        logging.error(f"User not found: {username}")
+        raise HTTPException(status_code=404, detail="User not found.")
+    
+    if not rbac_system.check_permission(user.role, action):
+        logging.warn(f"User {user.username} does not have permission for action: {action}")
+        raise HTTPException(status_code=403, detail="Permission denied.")
+    
+    logging.info(f"User {username} performed action: {action}")
+    return {"message": f"Action {action} performed by {username}"}
+
+@app.get('/export-users/')
+def export_users(db: SessionLocal = Depends(get_db)):
+    users = db.query(User).all()
+    with open('users.csv', mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["id", "username", "role"])
+        for user in users:
+            writer.writerow([user.id, user.username, user.role])
+    logging.info('User data exported to users.csv')
+    return {"message": "User data exported successfully."}
 
 def main():
     import uvicorn
-    try:
-        logging.info("Starting the Dais Project with RBAC enforcement.")
-        uvicorn.run(app, host="127.0.0.1", port=8000)
-    except Exception as e:
-        logging.error(f"Error starting the application: {e}")
-
+    os.makedirs("logs", exist_ok=True)
+    logging.info("Starting Dais Project with RBAC enforcement.")
+    uvicorn.run(app, host="127.0.0.1", port=8000)
 
 if __name__ == "__main__":
     main()
