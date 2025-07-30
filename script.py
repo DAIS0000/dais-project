@@ -1,26 +1,29 @@
 import logging
-import os
 import csv
-import hashlib
-import secrets
-import jwt
-from fastapi import FastAPI, Depends, HTTPException
-from sqlalchemy import create_engine, Column, Integer, String, ForeignKey
-from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.exc import IntegrityError
+import os
+from fastapi import FastAPI, Depends, HTTPException, Security
 from pydantic import BaseModel
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.exc import IntegrityError
+import bcrypt
+import jwt
+import secrets
 from typing import List, Optional
 
-logging.basicConfig(filename='dais_project.log', level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Setup logging
+logging.basicConfig(filename='dais_project.log', level=logging.INFO)
 
-DATABASE_URL = "sqlite:///./dais_project.db"
+DATABASE_URL = "sqlite:///./test.db"
 engine = create_engine(DATABASE_URL)
-SessionLocal = sessionmaker(bind=engine)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
 Base = declarative_base()
 
+# Define models
 class User(Base):
     __tablename__ = 'users'
-    
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     hashed_password = Column(String)
@@ -28,40 +31,38 @@ class User(Base):
 
 class Role(Base):
     __tablename__ = 'roles'
-    
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True)
 
 Base.metadata.create_all(bind=engine)
 
+# Define RBAC
+class RBAC:
+    def __init__(self):
+        self.permissions = {
+            'admin': ['read', 'write', 'delete'],
+            'editor': ['read', 'write'],
+            'viewer': ['read'],
+        }
+
+    def check_permission(self, role: str, permission: str) -> bool:
+        return permission in self.permissions.get(role, [])
+
+rbac = RBAC()
+
+# API Models
 class UserCreate(BaseModel):
     username: str
     password: str
     role: str
 
 class UserResponse(BaseModel):
-    id: int
     username: str
     role: str
 
-class RoleCreate(BaseModel):
-    name: str
-
-class RBAC:
-    def __init__(self):
-        self.permissions = {
-            "admin": ["read", "write", "delete"],
-            "editor": ["read", "write"],
-            "viewer": ["read"],
-        }
-
-    def check_permission(self, role: str, permission: str) -> bool:
-        return permission in self.permissions.get(role, [])
-        
-rbac_system = RBAC()
-
 app = FastAPI()
 
+# Dependency
 def get_db():
     db = SessionLocal()
     try:
@@ -69,71 +70,49 @@ def get_db():
     finally:
         db.close()
 
-@app.post('/users/', response_model=UserResponse)
-def create_user(user: UserCreate, db: SessionLocal = Depends(get_db)):
-    hashed_password = hashlib.sha256(user.password.encode()).hexdigest()
-    db_user = User(username=user.username, hashed_password=hashed_password, role=user.role)
-    db.add(db_user)
+# User CRUD operations
+@app.post("/users/", response_model=UserResponse)
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    user.hashed_password = bcrypt.hashpw(user.password.encode('utf-8'), bcrypt.gensalt())
+    db_user = User(username=user.username, hashed_password=user.hashed_password, role=user.role)
     try:
+        db.add(db_user)
         db.commit()
         db.refresh(db_user)
     except IntegrityError:
-        logging.error(f"User creation failed for {user.username}: user already exists.")
-        raise HTTPException(status_code=400, detail="User already exists.")
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Username already exists")
     logging.info(f"User created: {user.username} with role {user.role}")
     return db_user
 
-@app.post('/roles/', response_model=str)
-def create_role(role: RoleCreate, db: SessionLocal = Depends(get_db)):
-    db_role = Role(name=role.name)
-    db.add(db_role)
-    try:
-        db.commit()
-    except IntegrityError:
-        logging.error(f"Role creation failed for {role.name}: role already exists.")
-        raise HTTPException(status_code=400, detail="Role already exists.")
-    logging.info(f"Role created: {role.name}")
-    return role.name
+@app.get("/users/", response_model=List[UserResponse])
+def read_users(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
+    users = db.query(User).offset(skip).limit(limit).all()
+    return users
 
-@app.get('/users/{username}', response_model=UserResponse)
-def read_user(username: str, db: SessionLocal = Depends(get_db)):
-    user = db.query(User).filter(User.username == username).first()
-    if user is None:
-        logging.error(f"User not found: {username}")
-        raise HTTPException(status_code=404, detail="User not found.")
-    logging.info(f"User retrieved: {username}")
-    return user
+# RBAC enforcement
+@app.get("/data/")
+def read_data(role: str, permission: str, db: Session = Depends(get_db)):
+    if not rbac.check_permission(role, permission):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    logging.info(f"Access granted to {role} for {permission}")
+    return {"message": "Data accessed"}
 
-@app.post('/protected-endpoint/{action}')
-def protected_action(action: str, username: str, db: SessionLocal = Depends(get_db)):
-    user = db.query(User).filter(User.username == username).first()
-    if user is None:
-        logging.error(f"User not found: {username}")
-        raise HTTPException(status_code=404, detail="User not found.")
-    
-    if not rbac_system.check_permission(user.role, action):
-        logging.warn(f"User {user.username} does not have permission for action: {action}")
-        raise HTTPException(status_code=403, detail="Permission denied.")
-    
-    logging.info(f"User {username} performed action: {action}")
-    return {"message": f"Action {action} performed by {username}"}
-
-@app.get('/export-users/')
-def export_users(db: SessionLocal = Depends(get_db)):
+# CSV Export functionality
+@app.post("/export_users/")
+def export_users(db: Session = Depends(get_db)):
     users = db.query(User).all()
     with open('users.csv', mode='w', newline='') as file:
         writer = csv.writer(file)
-        writer.writerow(["id", "username", "role"])
+        writer.writerow(["ID", "Username", "Role"])
         for user in users:
             writer.writerow([user.id, user.username, user.role])
-    logging.info('User data exported to users.csv')
-    return {"message": "User data exported successfully."}
+    logging.info("User data exported to users.csv")
+    return {"message": "User data exported"}
 
-def main():
-    import uvicorn
-    os.makedirs("logs", exist_ok=True)
-    logging.info("Starting Dais Project with RBAC enforcement.")
-    uvicorn.run(app, host="127.0.0.1", port=8000)
-
+# Main function
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    os.makedirs(os.path.dirname('dais_project.log'), exist_ok=True)
+    logging.info("Starting the Dais Project application")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
